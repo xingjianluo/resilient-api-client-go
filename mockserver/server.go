@@ -71,6 +71,12 @@ func (s *Server) RefreshCount() int {
 	return s.refreshCount
 }
 
+// TotalRequests 返回数据端点（/items）收到的请求总数，
+// 用于验证重试/并发场景下请求没有被凭空放大。
+func (s *Server) TotalRequests() int64 {
+	return s.reqCounter.Load()
+}
+
 // FailNext 设置接下来 n 次数据请求返回 503。
 func (s *Server) FailNext(n int) {
 	s.mu.Lock()
