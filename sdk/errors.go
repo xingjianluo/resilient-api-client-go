@@ -23,6 +23,10 @@ const (
 	KindCanceled ErrorKind = "canceled"
 	// KindQuotaExhausted 限流配额耗尽（等待令牌时上下文结束）。
 	KindQuotaExhausted ErrorKind = "quota_exhausted"
+	// KindCheckpoint 续传标记无法解析或版本不兼容。
+	KindCheckpoint ErrorKind = "checkpoint"
+	// KindCursorAnomaly 服务端游标序列异常：停滞、重复成环或绕回。
+	KindCursorAnomaly ErrorKind = "cursor_anomaly"
 )
 
 // Error 是 SDK 对外暴露的统一错误类型，底层库异常不会直接透出。
