@@ -17,7 +17,8 @@ type Limits struct {
 	MaxDuration time.Duration
 	// MaxPages 本次运行最多拉取的页数。
 	MaxPages int
-	// MaxItems 本次运行最多产出的去重后元素数（以页为粒度，本页产出后判定）。
+	// MaxItems 本次运行最多产出的去重后元素数（硬上限：页内逐条判定，
+	// 到上限立即截断，单次 Run 产出绝不会超过该值；本页剩余元素留给续传）。
 	MaxItems int
 	// MaxEmptyPages 连续多少页没有新元素即判定服务端序列异常并收敛停止；
 	// <=0 时取默认值 defaultMaxEmptyPages。
@@ -210,11 +211,18 @@ func (w *Walker[T]) Run(ctx context.Context) WalkResult[T] {
 		w.cp.PagesDone++
 
 		// 5. 按 key 去重并入账：历史 Seen 跨进程保留，已处理内容不会重复产出。
+		//    MaxItems 是硬上限：页内逐条判定，到上限立即截断——本页剩余元素
+		//    不进 Seen、游标不推进，续传时重拉本页即可补齐，不重不漏。
 		added := 0
+		truncated := false
 		for _, it := range page.Items {
 			k := w.cfg.Key(it)
 			if w.cp.Seen[k] {
 				continue // 续传前已处理，或数据变动导致跨页漂移，跳过
+			}
+			if limits.MaxItems > 0 && len(out) >= limits.MaxItems {
+				truncated = true // 硬上限：本页剩余元素留给下一批
+				break
 			}
 			w.cp.Seen[k] = true
 			out = append(out, it)
@@ -229,7 +237,17 @@ func (w *Walker[T]) Run(ctx context.Context) WalkResult[T] {
 		logf("walk response cursor=%q next=%q items=%d new=%d empty_streak=%d",
 			w.cp.Cursor, page.NextCursor, len(page.Items), added, w.cp.EmptyStreak)
 
-		// 6. 序列判定：完成 / 停滞 / 绕回 / 持续空转——保证任何异常游标都能收敛停止。
+		// 6. 硬上限截断：到上限即正常收敛。游标仍指向本页（不推进），
+		//    已产出元素在 Seen 中，续传重拉本页时跳过已拿部分、补齐剩余；
+		//    即使本页 next_cursor 为空，页内仍有未取元素，必须归类为到上限
+		//    而非“全部拿完”。
+		if truncated {
+			logf("walk 判定=到条数上限 依据=硬上限截断 items=%d 上限=%d 游标不推进 cursor=%q（本页剩余留给续传）",
+				len(out), limits.MaxItems, w.cp.Cursor)
+			return w.finish(EndLimitItems, nil, out, runPages)
+		}
+
+		// 7. 序列判定：完成 / 停滞 / 绕回 / 持续空转——保证任何异常游标都能收敛停止。
 		if page.NextCursor == "" {
 			w.cp.Done = true
 			logf("walk 判定=完成 依据=next_cursor 为空 (pages_run=%d items_run=%d)", runPages, len(out))
@@ -252,14 +270,14 @@ func (w *Walker[T]) Run(ctx context.Context) WalkResult[T] {
 			return w.finish(EndCursorAnomaly, err, out, runPages)
 		}
 
-		// 7. 本页可能正好补满条数上限：正常收敛，游标已推进可续传。
+		// 8. 本页完整入账后正好补满条数上限：正常收敛，游标已推进可续传。
 		if limits.MaxItems > 0 && len(out) >= limits.MaxItems {
 			logf("walk 判定=到条数上限 items=%d next_cursor=%q", len(out), page.NextCursor)
 			w.advance(page.NextCursor)
 			return w.finish(EndLimitItems, nil, out, runPages)
 		}
 
-		// 8. 推进游标（页数/时间上限在下一轮顶部判定，且不会多发请求）。
+		// 9. 推进游标（页数/时间上限在下一轮顶部判定，且不会多发请求）。
 		w.advance(page.NextCursor)
 	}
 }

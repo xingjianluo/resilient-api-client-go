@@ -252,3 +252,115 @@ func TestWalkerE2EConcurrentSharedClient(t *testing.T) {
 	t.Logf("并发任务=%d 结束原因=%v 各自累计=%v /items请求=%d 凭证刷新=%d",
 		tasks, reasons, counts, srv.TotalRequests(), srv.RefreshCount())
 }
+
+// 条数硬上限端到端：上限小于单页时单批产出绝不超限；到上限后换进程
+// （新 client + JSON 标记）续传，剩余补齐且零重复。
+func TestWalkerE2EHardItemLimit(t *testing.T) {
+	srv := mockserver.New(nItems(10), 3600)
+	defer srv.Close()
+	c := newClient(t, srv.URL(), tokenProvider(srv.URL()))
+
+	// 页大小 4 > 上限 3：第一批必须恰好 3 条，一条不多。
+	w1 := sdk.NewWalker(newWalkerFetch(c, 4), walkerCfg(t, sdk.Limits{MaxItems: 3}))
+	r1 := w1.Run(context.Background())
+	if r1.Reason != sdk.EndLimitItems || r1.Err != nil || r1.ItemsCount != 3 {
+		t.Fatalf("run1: reason=%s items=%d err=%v（硬上限：不得超出 3）",
+			r1.Reason, r1.ItemsCount, r1.Err)
+	}
+	if r1.Checkpoint.Done {
+		t.Fatal("run1: 到上限时 checkpoint.Done 必须为 false")
+	}
+	raw, err := r1.Checkpoint.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("批次1: reason=%s items=%d（页大小4>上限3）实际请求=%d 标记=%s",
+		r1.Reason, r1.ItemsCount, srv.TotalRequests(), raw)
+
+	// 模拟新进程：新 client + JSON 反序列化标记，续传应补齐剩余 7 条。
+	cp, err := sdk.UnmarshalCheckpoint(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2 := newClient(t, srv.URL(), tokenProvider(srv.URL()))
+	r2 := sdk.ResumeWalker(newWalkerFetch(c2, 4), cp, walkerCfg(t, sdk.Limits{})).
+		Run(context.Background())
+	if r2.Reason != sdk.EndCompleted || r2.ItemsCount != 7 {
+		t.Fatalf("run2: reason=%s items=%d want completed/7", r2.Reason, r2.ItemsCount)
+	}
+	seen := map[string]int{}
+	for _, it := range append(append([]mockserver.Item{}, r1.Items...), r2.Items...) {
+		seen[it.ID]++
+	}
+	if len(seen) != 10 {
+		t.Fatalf("unique=%d want 10（续传漏取）", len(seen))
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("%s 出现 %d 次（续传重复）", id, n)
+		}
+	}
+	t.Logf("批次2: reason=%s 新拿=%d；合计唯一=%d/10 零重复，总请求=%d",
+		r2.Reason, r2.ItemsCount, len(seen), srv.TotalRequests())
+}
+
+// 多个同步任务共用一个 client，各设不同 MaxItems 并发跑：
+// 每批产出精确等于各自上限，续传后各拿到全集，互不串。
+func TestWalkerE2ESharedClientDistinctItemLimits(t *testing.T) {
+	srv := mockserver.New(nItems(8), 3600)
+	defer srv.Close()
+	c := newClient(t, srv.URL(), tokenProvider(srv.URL()))
+	c.Limiter = sdk.NewRateLimiter(1000, 100)
+
+	limits := []int{1, 3, 5, 0} // 0 = 不限；页大小 3
+	var wg sync.WaitGroup
+	first := make([]int, len(limits))
+	totals := make([]int, len(limits))
+	errs := make([]error, len(limits))
+	for j, lim := range limits {
+		wg.Add(1)
+		go func(task, lim int) {
+			defer wg.Done()
+			cfg := walkerCfg(t, sdk.Limits{MaxItems: lim})
+			r := sdk.NewWalker(newWalkerFetch(c, 3), cfg).Run(context.Background())
+			first[task] = r.ItemsCount
+			items := append([]mockserver.Item{}, r.Items...)
+			if lim > 0 {
+				if r.Reason != sdk.EndLimitItems || r.ItemsCount != lim {
+					errs[task] = errors.New("run1 not exact limit: " + string(r.Reason))
+					return
+				}
+				r2 := sdk.ResumeWalker(newWalkerFetch(c, 3), r.Checkpoint, walkerCfg(t, sdk.Limits{})).
+					Run(context.Background())
+				if r2.Reason != sdk.EndCompleted {
+					errs[task] = errors.New("resume not completed: " + string(r2.Reason))
+					return
+				}
+				items = append(items, r2.Items...)
+			}
+			uniq := map[string]bool{}
+			for _, it := range items {
+				if uniq[it.ID] {
+					errs[task] = errors.New("duplicate within task: " + it.ID)
+					return
+				}
+				uniq[it.ID] = true
+			}
+			totals[task] = len(uniq)
+		}(j, lim)
+	}
+	wg.Wait()
+	for j, lim := range limits {
+		if errs[j] != nil {
+			t.Fatalf("task %d (MaxItems=%d): %v", j, lim, errs[j])
+		}
+		if lim > 0 && first[j] != lim {
+			t.Fatalf("task %d: run1 items=%d 超过/不足上限 %d", j, first[j], lim)
+		}
+		if totals[j] != 8 {
+			t.Fatalf("task %d (MaxItems=%d): unique=%d want 8（任务间串数据或漏取）", j, lim, totals[j])
+		}
+	}
+	t.Logf("共享 client 并发 4 任务：各上限=%v 首批=%v 均精确收敛，续传后各唯一=%v",
+		limits, first, totals)
+}
