@@ -3,7 +3,9 @@ package sdk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -178,19 +180,31 @@ func TestWalkerLimitItems(t *testing.T) {
 	data := mkItems(10)
 	cfg := WalkerConfig[item]{
 		Key: func(i item) string { return i.ID },
-		// MaxItems 以页为粒度：第二页 3 条入账后 6>=5 即收敛（最多超一页的量）。
+		// MaxItems 是硬上限：页大小为 3，上限 5 落在第二页中间，
+		// 只产出 5 条（第一页 3 条 + 第二页前 2 条），第二页剩余 1 条留给下一批。
 		Limits: Limits{MaxItems: 5},
 		Logger: testLogger(t),
 	}
-	r := NewWalker(dataFetch(&data, 3), cfg).Run(context.Background())
-	if r.Reason != EndLimitItems || r.Err != nil || r.ItemsCount != 6 {
-		t.Fatalf("reason=%s err=%v items=%d", r.Reason, r.Err, r.ItemsCount)
+	fetch := dataFetch(&data, 3)
+	r := NewWalker(fetch, cfg).Run(context.Background())
+	if r.Reason != EndLimitItems || r.Err != nil || r.ItemsCount != 5 {
+		t.Fatalf("reason=%s err=%v items=%d want 5 (hard cap)", r.Reason, r.Err, r.ItemsCount)
 	}
-	t.Logf("判定依据: 到条数上限 -> reason=%s items=%d cursor=%s",
+	// 页内截断：游标不推进，仍停在第二页起点 "3"，供下一批重拉。
+	if r.Checkpoint.Cursor != "3" || r.Checkpoint.Done {
+		t.Fatalf("checkpoint cursor=%q done=%v want cursor=3", r.Checkpoint.Cursor, r.Checkpoint.Done)
+	}
+	if r.Checkpoint.ItemsDone != 5 {
+		t.Fatalf("items_done=%d want 5", r.Checkpoint.ItemsDone)
+	}
+	t.Logf("判定依据: 到条数硬上限 -> reason=%s items=%d 游标保持=%s（页内剩余条目留给下一批）",
 		r.Reason, r.ItemsCount, r.Checkpoint.Cursor)
 
-	// 续传后不应再产出这 5 条。
-	r2 := ResumeWalker(dataFetch(&data, 3), r.Checkpoint, cfg).Run(context.Background())
+	// 续传：新预算重拉第二页，已产出的 5 条由 Seen 过滤，不会重复。
+	r2 := ResumeWalker(fetch, r.Checkpoint, cfg).Run(context.Background())
+	if r2.Reason != EndLimitItems || r2.ItemsCount != 5 {
+		t.Fatalf("run2 reason=%s items=%d want limit_items/5", r2.Reason, r2.ItemsCount)
+	}
 	for _, it := range r2.Items {
 		for _, seen := range r.Items {
 			if it.ID == seen.ID {
@@ -198,6 +212,189 @@ func TestWalkerLimitItems(t *testing.T) {
 			}
 		}
 	}
+	// 再续传一次跑完：没有剩余，应判 completed 而非 limit_items。
+	cfg3 := cfg
+	cfg3.Limits = Limits{}
+	r3 := ResumeWalker(fetch, r2.Checkpoint, cfg3).Run(context.Background())
+	if r3.Reason != EndCompleted || r3.ItemsCount != 0 {
+		t.Fatalf("run3 reason=%s items=%d want completed/0", r3.Reason, r3.ItemsCount)
+	}
+	t.Logf("续传补齐: 批次2新拿=%d reason=%s；批次3新拿=%d reason=%s；累计去重=%d 零重复",
+		r2.ItemsCount, r2.Reason, r3.ItemsCount, r3.Reason, r3.Checkpoint.ItemsDone)
+}
+
+// ---- MaxItems 硬上限：页大小、页中截断、终态边界、跨进程续传补齐 ----
+
+// 上限小于单页大小：服务端一页返回 10 条、上限只要 3 条时，
+// 实际产出必须恰好 3 条（旧实现会给足整页 10 条），且只发 1 次请求、游标不动。
+func TestWalkerLimitItemsHardCapSmallerThanPage(t *testing.T) {
+	data := mkItems(25)
+	cfg := WalkerConfig[item]{
+		Key:    func(i item) string { return i.ID },
+		Limits: Limits{MaxItems: 3},
+		Logger: testLogger(t),
+	}
+	var calls int
+	fetch := func(ctx context.Context, cursor string) (Page[item], error) {
+		calls++
+		return dataFetch(&data, 10)(ctx, cursor)
+	}
+	r := NewWalker(fetch, cfg).Run(context.Background())
+	if r.Reason != EndLimitItems {
+		t.Fatalf("reason=%s want limit_items (err=%v)", r.Reason, r.Err)
+	}
+	if r.ItemsCount != 3 {
+		t.Fatalf("items=%d want 3：硬上限不得被整页放大", r.ItemsCount)
+	}
+	if calls != 1 || r.Pages != 1 {
+		t.Fatalf("requests=%d pages=%d want 1/1：到上限不得多发请求", calls, r.Pages)
+	}
+	if r.Checkpoint.Cursor != "" || r.Checkpoint.Done {
+		t.Fatalf("cursor=%q done=%v：页内截断时游标必须停在本页起点 %q",
+			r.Checkpoint.Cursor, r.Checkpoint.Done, "")
+	}
+	wantIDs := []string{"id-0", "id-1", "id-2"}
+	for i, it := range r.Items {
+		if it.ID != wantIDs[i] {
+			t.Fatalf("item[%d]=%s want %s", i, it.ID, wantIDs[i])
+		}
+	}
+	t.Logf("判定依据: 单页返回10条 > 上限3 -> 页内截断，实际产出=%d 请求数=%d 游标保持%q",
+		r.ItemsCount, calls, r.Checkpoint.Cursor)
+}
+
+// 上限正好落在最后一页（含“上限==总条数”）：只要预算先补满就必须报 limit_items，
+// 不能因为 next_cursor 为空就报成 completed；末页中间截断时续传要补齐剩余条目。
+func TestWalkerLimitItemsLandsOnLastPage(t *testing.T) {
+	cases := []struct {
+		name     string
+		total    int
+		pageSize int
+		maxItems int
+	}{
+		{"上限落在最后一页中间", 10, 6, 8}, // 页：6 + 4，上限 8 落在末页中间，末页剩 2 条
+		{"上限恰等于总条数", 9, 3, 9},    // 最后一页 3 条恰好补满 9（整页边界）
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := mkItems(tc.total)
+			cfg := WalkerConfig[item]{
+				Key:    func(i item) string { return i.ID },
+				Limits: Limits{MaxItems: tc.maxItems},
+				Logger: testLogger(t),
+			}
+			r := NewWalker(dataFetch(&data, tc.pageSize), cfg).Run(context.Background())
+			if r.Reason != EndLimitItems || r.Err != nil {
+				t.Fatalf("reason=%s err=%v want limit_items（上限落在最后一页也不能报 completed）",
+					r.Reason, r.Err)
+			}
+			if r.ItemsCount != tc.maxItems {
+				t.Fatalf("items=%d want %d", r.ItemsCount, tc.maxItems)
+			}
+			t.Logf("判定依据: %s total=%d page=%d max=%d -> reason=%s done=%v cursor=%q",
+				tc.name, tc.total, tc.pageSize, tc.maxItems, r.Reason, r.Checkpoint.Done, r.Checkpoint.Cursor)
+
+			// 续传：未消费完的末页要补齐；整页边界补满的情形直接终态。两种都不得重复。
+			r2 := ResumeWalker(dataFetch(&data, tc.pageSize), r.Checkpoint, WalkerConfig[item]{
+				Key:    cfg.Key,
+				Limits: Limits{}, // 新进程不给上限，跑完剩余
+				Logger: testLogger(t),
+			}).Run(context.Background())
+			if r2.Reason != EndCompleted {
+				t.Fatalf("resume reason=%s want completed", r2.Reason)
+			}
+			if r.ItemsCount+r2.ItemsCount != tc.total {
+				t.Fatalf("累计=%d+%d want %d：续传补齐后既不遗漏也不重复",
+					r.ItemsCount, r2.ItemsCount, tc.total)
+			}
+			for _, it := range r2.Items {
+				for _, seen := range r.Items {
+					if it.ID == seen.ID {
+						t.Fatalf("resume 重复产出已处理条目 %s", it.ID)
+					}
+				}
+			}
+			t.Logf("续传补齐: 批次1=%d reason=%s；批次2新拿=%d reason=%s；累计=%d 零重复",
+				r.ItemsCount, r.Reason, r2.ItemsCount, r2.Reason, r.ItemsCount+r2.ItemsCount)
+		})
+	}
+}
+
+// 跨进程续传补齐（经 JSON 落盘/反序列化，模拟新进程）：
+// 页大小 10、每批 MaxItems=3，10 条数据要分多批拿完；
+// 第一批就停在第一页中间，后续每批重拉当前页、跳过 Seen，直到末页补齐。
+// 任何一批产出都不得超过 3，合并后恰好 10 条且零重复。
+func TestWalkerLimitItemsHardCapResumeAcrossProcesses(t *testing.T) {
+	data := mkItems(10)
+	pageFetch := dataFetch(&data, 10) // 服务端每页给 10 条（比每批上限大）
+	cfg := WalkerConfig[item]{
+		Key:    func(i item) string { return i.ID },
+		Limits: Limits{MaxItems: 3},
+		Logger: testLogger(t),
+	}
+
+	var collected []item
+	cp := Checkpoint{Version: CheckpointVersion}
+	batch := 0
+	for {
+		batch++
+		// 每个批次都是“新进程”：第一批从头建 Walker，之后从落盘标记恢复，预算每批重新给 3。
+		var w *Walker[item]
+		if batch == 1 {
+			w = NewWalker(pageFetch, cfg)
+		} else {
+			w = ResumeWalker(pageFetch, cp, cfg)
+		}
+		r := w.Run(context.Background())
+		if r.Err != nil {
+			t.Fatalf("batch %d err=%v", batch, r.Err)
+		}
+		if r.ItemsCount > 3 {
+			t.Fatalf("batch %d 产出 %d 条，超过硬上限 3", batch, r.ItemsCount)
+		}
+		collected = append(collected, r.Items...)
+		t.Logf("批次%d reason=%s 本批=%d cursor=%q done=%v",
+			batch, r.Reason, r.ItemsCount, r.Checkpoint.Cursor, r.Checkpoint.Done)
+
+		// 模拟落盘 -> 新进程反序列化。
+		raw, err := r.Checkpoint.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cp, err = UnmarshalCheckpoint(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if r.Reason == EndCompleted {
+			break
+		}
+		if r.Reason != EndLimitItems {
+			t.Fatalf("batch %d reason=%s want limit_items/completed", batch, r.Reason)
+		}
+		if batch > 10 {
+			t.Fatal("超过 10 批仍未补齐，续传没有推进")
+		}
+	}
+
+	if len(collected) != 10 {
+		t.Fatalf("累计产出=%d want 10（剩余条目被遗漏）", len(collected))
+	}
+	counts := map[string]int{}
+	for _, it := range collected {
+		counts[it.ID]++
+	}
+	for i := 0; i < 10; i++ {
+		id := "id-" + strconv.Itoa(i)
+		if counts[id] != 1 {
+			t.Fatalf("%s 出现 %d 次（要求恰好 1 次：不重复不遗漏）", id, counts[id])
+		}
+	}
+	if !cp.Done || cp.ItemsDone != 10 {
+		t.Fatalf("终态标记 done=%v items_done=%d want true/10", cp.Done, cp.ItemsDone)
+	}
+	t.Logf("判定依据: %d 批全部 reason∈{limit_items,completed}，末批 completed；累计去重=%d 零重复",
+		batch, len(collected))
 }
 
 // fakeClock 每次 Now 推进固定步长，用于确定性地触发时间上限，避免真实睡眠。
@@ -417,7 +614,170 @@ func TestWalkerCompletedIsTerminal(t *testing.T) {
 	}
 }
 
-// ---- 并发隔离：多个 Walker 各跑各的标记与上限，互不串数据 ----
+// 结束原因归类：MaxItems 收敛必须与取消/超时/配额耗尽严格区分。
+// 特别地：批次产出恰好到上限的同一时刻，调用方 ctx 也已取消，
+// 正常收敛（limit_items）优先——本批已完成、标记可用，不应改报 canceled。
+func TestWalkerLimitItemsNotConfusedWithOtherReasons(t *testing.T) {
+	key := func(i item) string { return i.ID }
+
+	// 1. 到上限与 ctx 取消同时发生：首屏数据到手后调用方立刻取消，
+	//    本批恰好产出到上限 -> limit_items 正常收束（循环顶部不再复查 ctx）。
+	data := mkItems(5)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	fetchCancelAfterFirst := func(ctx context.Context, cursor string) (Page[item], error) {
+		p, err := dataFetch(&data, 10)(ctx, cursor)
+		cancel2() // 首屏数据已到手，返回后调用方 ctx 变为 canceled
+		return p, err
+	}
+	r := NewWalker(fetchCancelAfterFirst, WalkerConfig[item]{
+		Key: key, Limits: Limits{MaxItems: 5}, Logger: testLogger(t),
+	}).Run(ctx2)
+	if r.Reason != EndLimitItems || r.Err != nil {
+		t.Fatalf("到上限当步: reason=%s err=%v want limit_items/nil", r.Reason, r.Err)
+	}
+	if r.ItemsCount != 5 {
+		t.Fatalf("items=%d want 5", r.ItemsCount)
+	}
+	t.Logf("到上限当步 ctx 随后取消 -> reason=%s（正常收束优先，不发下一页请求）", r.Reason)
+
+	// 2. 首批之前 ctx 已取消：必须报 canceled，不能因为设了 MaxItems 就报 limit_items。
+	data2 := mkItems(100)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r = NewWalker(dataFetch(&data2, 10), WalkerConfig[item]{
+		Key: key, Limits: Limits{MaxItems: 3}, Logger: testLogger(t),
+	}).Run(ctx)
+	if r.Reason != EndCanceled {
+		t.Fatalf("首批前 ctx 已取消: reason=%s want canceled", r.Reason)
+	}
+	t.Logf("首批前 ctx 已取消 -> reason=%s（不被上限掩盖）", r.Reason)
+
+	// 3. 配额错误：设了 MaxItems 也不能报成 limit_items。
+	quotaFetch := func(ctx context.Context, cursor string) (Page[item], error) {
+		return Page[item]{}, &Error{Kind: KindQuotaExhausted, Op: "fetch",
+			Err: errors.New("quota not available")}
+	}
+	r = NewWalker(quotaFetch, WalkerConfig[item]{
+		Key: key, Limits: Limits{MaxItems: 3}, Logger: testLogger(t),
+	}).Run(context.Background())
+	if r.Reason != EndQuotaExhausted || KindOf(r.Err) != KindQuotaExhausted {
+		t.Fatalf("quota: reason=%s kind=%s", r.Reason, KindOf(r.Err))
+	}
+	t.Logf("配额等不到 + 设了 MaxItems -> reason=%s（不被当成到上限）", r.Reason)
+
+	// 4. 没有剩余数据且未到上限：completed，不能因为 MaxItems>0 就报 limit_items。
+	data3 := mkItems(2)
+	r = NewWalker(dataFetch(&data3, 10), WalkerConfig[item]{
+		Key: key, Limits: Limits{MaxItems: 100}, Logger: testLogger(t),
+	}).Run(context.Background())
+	if r.Reason != EndCompleted || r.ItemsCount != 2 {
+		t.Fatalf("数据少于上限: reason=%s items=%d want completed/2", r.Reason, r.ItemsCount)
+	}
+	t.Logf("数据总量 2 < 上限 100 -> reason=%s（到上限与全部拿完分得清）", r.Reason)
+}
+
+// ---- 并发隔离（MaxItems 硬上限版）：多任务共用同一底层抓取函数，
+//      各设不同的条数上限（且都小于页大小），产出、标记、结束原因互不串 ----
+
+func TestWalkerConcurrentIsolationDistinctItemCaps(t *testing.T) {
+	const tasks = 4
+	const total = 9
+	const pageSize = 5 // 比所有任务的上限都大，必然触发页内截断
+
+	// 每个任务独立数据集，key 带任务前缀；抓取函数各自带锁，
+	// 但同一 dataFetch 闭包被“共享”（模拟共用底层 client/限流器的使用方式）。
+	makeData := func(task int) []item {
+		out := make([]item, total)
+		for i := range out {
+			out[i] = item{ID: "task" + strconv.Itoa(task) + "-" + strconv.Itoa(i)}
+		}
+		return out
+	}
+	caps := []int{2, 3, 1, 4} // 每个任务不同的硬上限
+
+	var wg sync.WaitGroup
+	errs := make([]error, tasks)
+	firstReasons := make([]EndReason, tasks)
+	totals := make([]int, tasks)
+	for j := 0; j < tasks; j++ {
+		wg.Add(1)
+		go func(task int) {
+			defer wg.Done()
+			data := makeData(task)
+			fetch := dataFetch(&data, pageSize)
+			cfg := WalkerConfig[item]{
+				Key:    func(i item) string { return i.ID },
+				Limits: Limits{MaxItems: caps[task]},
+				Logger: testLogger(t),
+			}
+			r := NewWalker(fetch, cfg).Run(context.Background())
+			firstReasons[task] = r.Reason
+			if r.Reason != EndLimitItems {
+				errs[task] = fmt.Errorf("task %d first reason=%s want limit_items", task, r.Reason)
+				return
+			}
+			if r.ItemsCount != caps[task] {
+				errs[task] = fmt.Errorf("task %d first items=%d want hard cap %d",
+					task, r.ItemsCount, caps[task])
+				return
+			}
+			got := map[string]bool{}
+			for _, it := range r.Items {
+				// 串数据检测：每个 key 必须属于本任务前缀。
+				if !strings.HasPrefix(it.ID, "task"+strconv.Itoa(task)+"-") {
+					errs[task] = fmt.Errorf("task %d 收到别的任务的数据 %s", task, it.ID)
+					return
+				}
+				got[it.ID] = true
+			}
+			totals[task] += r.ItemsCount
+
+			// 续传批次：反复用自己的标记 + 新预算直到完成。
+			cp := r.Checkpoint
+			for b := 0; ; b++ {
+				r2 := ResumeWalker(fetch, cp, cfg).Run(context.Background())
+				if r2.Err != nil {
+					errs[task] = fmt.Errorf("task %d resume: %w", task, r2.Err)
+					return
+				}
+				for _, it := range r2.Items {
+					if !strings.HasPrefix(it.ID, "task"+strconv.Itoa(task)+"-") {
+						errs[task] = fmt.Errorf("task %d 续传收到别的任务的数据 %s", task, it.ID)
+						return
+					}
+					if got[it.ID] {
+						errs[task] = fmt.Errorf("task %d 续传重复产出 %s", task, it.ID)
+						return
+					}
+					got[it.ID] = true
+				}
+				totals[task] += r2.ItemsCount
+				cp = r2.Checkpoint
+				if r2.Reason == EndCompleted {
+					break
+				}
+				if r2.Reason != EndLimitItems || b > total+1 {
+					errs[task] = fmt.Errorf("task %d unexpected resume reason=%s", task, r2.Reason)
+					return
+				}
+			}
+		}(j)
+	}
+	wg.Wait()
+	for j := 0; j < tasks; j++ {
+		if errs[j] != nil {
+			t.Fatal(errs[j])
+		}
+		if totals[j] != total {
+			t.Fatalf("task %d 累计=%d want %d（漏取或串数据）", j, totals[j], total)
+		}
+		if firstReasons[j] != EndLimitItems {
+			t.Fatalf("task %d first reason=%s", j, firstReasons[j])
+		}
+	}
+	t.Logf("并发任务=%d 各自硬上限=%v 首批原因=%v 各自补齐累计=%v（标记/上限互不串）",
+		tasks, caps, firstReasons, totals)
+}
 
 func TestWalkerConcurrentIsolation(t *testing.T) {
 	const tasks = 4

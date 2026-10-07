@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -193,7 +194,170 @@ func TestWalkerE2EServerCursorAnomaly(t *testing.T) {
 	})
 }
 
-// 多个同步任务共用一个 client / 凭证 / 限流器并发跑：
+// MaxItems 硬上端到端：单任务。服务端每页返回 5 条，本批上限只要 3 条：
+// 首批必须恰好 3 条且只打 1 次请求（页内截断，游标不动）；
+// 标记落盘、新进程反复续传（每批新预算）直到补齐 9 条，零重复、不漏取。
+func TestWalkerE2EItemHardCapAndResume(t *testing.T) {
+	srv := mockserver.New(nItems(9), 3600)
+	defer srv.Close()
+	c := newClient(t, srv.URL(), tokenProvider(srv.URL()))
+	c.Retry.BaseDelay = 5 * time.Millisecond
+	c.Retry.MaxDelay = 20 * time.Millisecond
+
+	const pageSize = 5
+	const capItems = 3
+	fetch := newWalkerFetch(c, pageSize)
+
+	w1 := sdk.NewWalker(fetch, walkerCfg(t, sdk.Limits{MaxItems: capItems}))
+	r1 := w1.Run(context.Background())
+	if r1.Reason != sdk.EndLimitItems || r1.ItemsCount != 3 || r1.Pages != 1 {
+		t.Fatalf("run1: reason=%s items=%d pages=%d", r1.Reason, r1.ItemsCount, r1.Pages)
+	}
+	if r1.Checkpoint.Cursor != "" {
+		t.Fatalf("页内截断游标应停在首页起点，got cursor=%q", r1.Checkpoint.Cursor)
+	}
+	raw, err := r1.Checkpoint.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("批次1: 服务端页大小=%d 上限=%d -> reason=%s 实拿=%d 请求数=%d 标记=%s",
+		pageSize, capItems, r1.Reason, r1.ItemsCount, srv.TotalRequests(), raw)
+
+	// 模拟新进程：从 JSON 恢复，每批新预算 3，直到 completed。
+	collected := append([]mockserver.Item{}, r1.Items...)
+	cp, err := sdk.UnmarshalCheckpoint(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := 1
+	for {
+		batch++
+		c2 := newClient(t, srv.URL(), tokenProvider(srv.URL()))
+		w := sdk.ResumeWalker(newWalkerFetch(c2, pageSize), cp, walkerCfg(t, sdk.Limits{MaxItems: capItems}))
+		r := w.Run(context.Background())
+		if r.Err != nil {
+			t.Fatalf("batch %d: %v", batch, r.Err)
+		}
+		if r.ItemsCount > capItems {
+			t.Fatalf("batch %d 产出=%d 超过硬上限 %d", batch, r.ItemsCount, capItems)
+		}
+		collected = append(collected, r.Items...)
+		cp = r.Checkpoint
+		t.Logf("批次%d: reason=%s 本批=%d 累计=%d cursor=%q done=%v",
+			batch, r.Reason, r.ItemsCount, len(collected), cp.Cursor, cp.Done)
+		if r.Reason == sdk.EndCompleted {
+			break
+		}
+		if r.Reason != sdk.EndLimitItems {
+			t.Fatalf("batch %d reason=%s", batch, r.Reason)
+		}
+		if batch > 10 {
+			t.Fatal("续传批次过多，未推进")
+		}
+	}
+	seen := map[string]int{}
+	for _, it := range collected {
+		seen[it.ID]++
+	}
+	if len(seen) != 9 {
+		t.Fatalf("累计唯一=%d want 9（漏取或重复）", len(seen))
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("%s 出现 %d 次", id, n)
+		}
+	}
+	// 页大小 5、总数 9 共 2 个服务端页；页内截断只重拉“同一页”，不产生越界请求。
+	// 批次：3（第1页）+3（重拉第1页，2新+截断前看到的已Seen）…… 实际共需覆盖 2 个不同游标。
+	if got := srv.TotalRequests(); got < 2 {
+		t.Fatalf("总请求=%d 异常", got)
+	}
+	t.Logf("补齐完成: %d 批，累计唯一=%d，/items 总请求=%d（含页内截断的同页重拉，无越界）",
+		batch, len(seen), srv.TotalRequests())
+}
+
+// 多个同步任务共用一个 client / 凭证 / 限流器，各设不同的 MaxItems 硬上限
+// （都小于服务端页大小）：首批产出被各自上限精确截断，续传各自补齐，互不串。
+func TestWalkerE2EConcurrentDistinctItemCaps(t *testing.T) {
+	srv := mockserver.New(nItems(9), 3600)
+	defer srv.Close()
+
+	tp := tokenProvider(srv.URL())
+	c := newClient(t, srv.URL(), tp)
+	c.Limiter = sdk.NewRateLimiter(1000, 100) // 共享限流但配额充足
+
+	const tasks = 4
+	pageSize := 5
+	caps := []int{2, 3, 1, 4} // 各任务不同上限，且都 < 页大小
+	var wg sync.WaitGroup
+	errs := make([]error, tasks)
+	firstReasons := make([]sdk.EndReason, tasks)
+	totals := make([]int, tasks)
+	for j := 0; j < tasks; j++ {
+		wg.Add(1)
+		go func(task int) {
+			defer wg.Done()
+			cfg := walkerCfg(t, sdk.Limits{MaxItems: caps[task]})
+			w := sdk.NewWalker(newWalkerFetch(c, pageSize), cfg)
+			r := w.Run(context.Background())
+			firstReasons[task] = r.Reason
+			if r.Reason != sdk.EndLimitItems || r.ItemsCount != caps[task] {
+				errs[task] = fmt.Errorf("task %d first: reason=%s items=%d want limit_items/%d",
+					task, r.Reason, r.ItemsCount, caps[task])
+				return
+			}
+			got := map[string]bool{}
+			for _, it := range r.Items {
+				got[it.ID] = true
+			}
+			totals[task] += r.ItemsCount
+
+			cp := r.Checkpoint
+			for b := 0; ; b++ {
+				r2 := sdk.ResumeWalker(newWalkerFetch(c, pageSize), cp, cfg).Run(context.Background())
+				if r2.Err != nil {
+					errs[task] = fmt.Errorf("task %d resume: %w", task, r2.Err)
+					return
+				}
+				for _, it := range r2.Items {
+					if got[it.ID] {
+						errs[task] = fmt.Errorf("task %d 重复产出 %s", task, it.ID)
+						return
+					}
+					got[it.ID] = true
+				}
+				totals[task] += r2.ItemsCount
+				cp = r2.Checkpoint
+				if r2.Reason == sdk.EndCompleted {
+					break
+				}
+				if r2.Reason != sdk.EndLimitItems || b > 10 {
+					errs[task] = fmt.Errorf("task %d resume reason=%s", task, r2.Reason)
+					return
+				}
+			}
+		}(j)
+	}
+	wg.Wait()
+	for j := 0; j < tasks; j++ {
+		if errs[j] != nil {
+			t.Fatal(errs[j])
+		}
+		if totals[j] != 9 {
+			t.Fatalf("task %d 累计=%d want 9", j, totals[j])
+		}
+		if firstReasons[j] != sdk.EndLimitItems {
+			t.Fatalf("task %d first reason=%s", j, firstReasons[j])
+		}
+	}
+	// 共享凭证只刷新一次（与各任务的条数上限无关）。
+	if got := srv.RefreshCount(); got != 1 {
+		t.Fatalf("凭证刷新次数=%d want 1", got)
+	}
+	t.Logf("并发任务=%d 页大小=%d 各自上限=%v 首批原因=%v 各自补齐累计=%v 凭证刷新=%d",
+		tasks, pageSize, caps, firstReasons, totals, srv.RefreshCount())
+}
+
 // 各自的标记、上限、结束原因互不干扰；凭证只刷新一次；请求数恰为页数之和。
 func TestWalkerE2EConcurrentSharedClient(t *testing.T) {
 	srv := mockserver.New(nItems(9), 3600)

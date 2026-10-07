@@ -17,7 +17,10 @@ type Limits struct {
 	MaxDuration time.Duration
 	// MaxPages 本次运行最多拉取的页数。
 	MaxPages int
-	// MaxItems 本次运行最多产出的去重后元素数（以页为粒度，本页产出后判定）。
+	// MaxItems 本次运行最多产出的去重后元素数，是硬上限：
+	// 即使上限落在服务端某一页的中间，也只产出到上限为止的条目并立即收束，
+	// 不会为凑完一整页而多拿；页内剩余条目留给下一批（游标不动，续传重拉本页，
+	// 已产出条目靠 Seen 去重跳过）。
 	MaxItems int
 	// MaxEmptyPages 连续多少页没有新元素即判定服务端序列异常并收敛停止；
 	// <=0 时取默认值 defaultMaxEmptyPages。
@@ -185,6 +188,8 @@ func (w *Walker[T]) Run(ctx context.Context) WalkResult[T] {
 			return w.finish(EndLimitPages, nil, out, runPages)
 		}
 		if limits.MaxItems > 0 && len(out) >= limits.MaxItems {
+			// 防御性兜底：正常情况下上一页页内截断时 Run 已收束，不会再回到循环顶部；
+			// 走到这里说明预算在上一轮结束后恰好补满（整页边界），不发下一页请求。
 			logf("walk 判定=到条数上限 items=%d next_cursor=%q", len(out), w.cp.Cursor)
 			return w.finish(EndLimitItems, nil, out, runPages)
 		}
@@ -209,12 +214,20 @@ func (w *Walker[T]) Run(ctx context.Context) WalkResult[T] {
 		runPages++
 		w.cp.PagesDone++
 
-		// 5. 按 key 去重并入账：历史 Seen 跨进程保留，已处理内容不会重复产出。
+		// 5. 按 key 逐条去并入账：历史 Seen 跨进程保留，已处理内容不会重复产出。
+		//    MaxItems 是硬上限：剩余预算为 0 时在页内立即截断，本页未消费的条目
+		//    既不入账也不推进游标（续传时重拉本页，靠 Seen 跳过已产出部分），
+		//    因此无论服务端一页返回多少条，本次产出都不可能超过 MaxItems。
 		added := 0
+		truncated := false
 		for _, it := range page.Items {
+			if limits.MaxItems > 0 && len(out) >= limits.MaxItems {
+				truncated = true // 预算恰在本页中间用完
+				break
+			}
 			k := w.cfg.Key(it)
 			if w.cp.Seen[k] {
-				continue // 续传前已处理，或数据变动导致跨页漂移，跳过
+				continue // 续传前已处理，或数据变动导致跨页漂移，跳过；不消耗条数预算
 			}
 			w.cp.Seen[k] = true
 			out = append(out, it)
@@ -226,12 +239,27 @@ func (w *Walker[T]) Run(ctx context.Context) WalkResult[T] {
 		} else {
 			w.cp.EmptyStreak++
 		}
-		logf("walk response cursor=%q next=%q items=%d new=%d empty_streak=%d",
-			w.cp.Cursor, page.NextCursor, len(page.Items), added, w.cp.EmptyStreak)
+		logf("walk response cursor=%q next=%q items=%d new=%d truncated=%v empty_streak=%d",
+			w.cp.Cursor, page.NextCursor, len(page.Items), added, truncated, w.cp.EmptyStreak)
+
+		// 5.1 上限落在本页中间：直接以页内位置收束。游标保持不动（下一批重拉本页，
+		//     已产出条目由 Seen 过滤），不做游标序列判定——本页尚未消费完，谈不上推进。
+		if truncated {
+			logf("walk 判定=到条数上限(硬截断) items=%d budget=%d 游标保持=%q（未消费条目留给下一批）",
+				len(out), limits.MaxItems, w.cp.Cursor)
+			return w.finish(EndLimitItems, nil, out, runPages)
+		}
 
 		// 6. 序列判定：完成 / 停滞 / 绕回 / 持续空转——保证任何异常游标都能收敛停止。
+		//    注意：完成判定必须先于“整页恰好补满上限”的判定，否则最后一页恰好等于
+		//    剩余预算时会把终态误报成到上限；反之未到终态的补满必须报 limit_items，
+		//    不能误报成 completed。
 		if page.NextCursor == "" {
 			w.cp.Done = true
+			if limits.MaxItems > 0 && len(out) >= limits.MaxItems {
+				logf("walk 判定=到条数上限 items=%d 依据=预算补满且 next_cursor 为空(终态 done=true)", len(out))
+				return w.finish(EndLimitItems, nil, out, runPages)
+			}
 			logf("walk 判定=完成 依据=next_cursor 为空 (pages_run=%d items_run=%d)", runPages, len(out))
 			return w.finish(EndCompleted, nil, out, runPages)
 		}
@@ -252,7 +280,8 @@ func (w *Walker[T]) Run(ctx context.Context) WalkResult[T] {
 			return w.finish(EndCursorAnomaly, err, out, runPages)
 		}
 
-		// 7. 本页可能正好补满条数上限：正常收敛，游标已推进可续传。
+		// 7. 本页条目全部消费完且正好补满条数上限：正常收敛，游标已推进可续传。
+		//    （上限落在页中间的情形已在 5.1 处理；next_cursor 为空的终态在第 6 步处理。）
 		if limits.MaxItems > 0 && len(out) >= limits.MaxItems {
 			logf("walk 判定=到条数上限 items=%d next_cursor=%q", len(out), page.NextCursor)
 			w.advance(page.NextCursor)
